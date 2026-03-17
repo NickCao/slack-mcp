@@ -1,3 +1,11 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "httpx==0.28.1",
+#     "mcp==1.11.0",
+# ]
+# ///
+
 import os
 from typing import Any, Literal
 import httpx
@@ -19,6 +27,7 @@ USER_CACHE_FILE = SCRIPT_DIR / ".user_cache.json"
 
 # Cache for channel name to ID mapping
 _channel_cache: dict[str, str] = {}
+_conversations_list_disabled = False
 
 # Cache for user ID to handle mapping
 _user_cache: dict[str, str] = {}
@@ -360,26 +369,66 @@ async def get_channel_history(
 
 async def _load_channels_to_cache() -> bool:
     """Load all channels into the cache. Returns True if successful."""
-    global _channel_cache
+    global _channel_cache, _conversations_list_disabled
+
+    if _conversations_list_disabled:
+        return False
 
     url = f"{SLACK_API_BASE}/conversations.list"
-    payload = {"exclude_archived": "true", "types": "public_channel,private_channel"}
-    data = await make_request(url, method="GET", payload=payload)
+    cursor = None
+    all_channels = []
 
-    if data and data.get("ok"):
-        channels = data.get("channels", [])
-        _channel_cache.clear()
-        for channel in channels:
-            channel_name = channel.get("name", "")
-            channel_id = channel.get("id", "")
-            if channel_name and channel_id:
+    while True:
+        payload = {"exclude_archived": "true", "types": "public_channel,private_channel", "limit": "1000"}
+        if cursor:
+            payload["cursor"] = cursor
+
+        data = await make_request(url, method="GET", payload=payload)
+
+        if not data or not data.get("ok"):
+            error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
+            print(f"Error loading channels to cache: {error_msg}")
+            if error_msg == "enterprise_is_restricted":
+                _conversations_list_disabled = True
+            return False
+
+        all_channels.extend(data.get("channels", []))
+
+        cursor = data.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    _channel_cache.clear()
+    for channel in all_channels:
+        channel_name = channel.get("name", "")
+        channel_id = channel.get("id", "")
+        if channel_name and channel_id:
+            _channel_cache[channel_name] = channel_id
+    print(f"Loaded {len(_channel_cache)} channels into cache")
+    return True
+
+
+async def _search_channel_by_name(channel_name: str) -> str:
+    """Search for a channel by name using search.modules (works on Enterprise Grid)."""
+    url = f"{SLACK_API_BASE}/search.modules"
+    payload = {"query": channel_name, "module": "channels", "count": 10}
+    data = await make_request(url, payload=payload)
+
+    if not data or not data.get("ok"):
+        error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
+        print(f"Error searching for channel: {error_msg}")
+        return ""
+
+    for item in data.get("items", []):
+        if item.get("name") == channel_name:
+            channel_id = item.get("id", "")
+            if channel_id:
                 _channel_cache[channel_name] = channel_id
-        print(f"Loaded {len(_channel_cache)} channels into cache")
-        return True
+                print(f"Channel '{channel_name}' found via search: {channel_id}")
+            return channel_id
 
-    error_msg = data.get("error", "Unknown error") if data else "No response from Slack API"
-    print(f"Error loading channels to cache: {error_msg}")
-    return False
+    print(f"Channel '{channel_name}' not found via search")
+    return ""
 
 
 @mcp.tool()
@@ -387,22 +436,21 @@ async def get_channel_id_by_name(channel_name: str) -> str:
     """Get the channel ID by channel name. The channel name can be with or without the # prefix."""
     # Remove # prefix if present
     clean_name = channel_name.lstrip("#")
-    await log_to_slack(f"Looking up channel ID for channel name: {clean_name}")
 
     # Check cache first
     if clean_name in _channel_cache:
         print(f"Channel '{clean_name}' found in cache")
         return _channel_cache[clean_name]
 
-    # Cache miss - load all channels
+    # Cache miss - try loading all channels first
     print(f"Cache miss for '{clean_name}', loading channels...")
     if await _load_channels_to_cache():
-        # Check cache again after loading
         if clean_name in _channel_cache:
             return _channel_cache[clean_name]
 
-    print(f"Channel '{clean_name}' not found")
-    return ""
+    # Fallback to search (works on Enterprise Grid where conversations.list is restricted)
+    print(f"Falling back to search for '{clean_name}'...")
+    return await _search_channel_by_name(clean_name)
 
 
 @mcp.tool()
